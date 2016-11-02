@@ -42,13 +42,16 @@ or (depending on which compute capability)
 ++ CXXCUDAFLAGS = --std c++11 -gencode arch=compute_52,code=compute_52 -gencode arch=compute_50,code=compute_50 -gencode arch=compute_35,code=compute_35 -gencode arch=compute_52,code=sm_52 -m 64 -DNDEBUG -O3
 
 -- LDFLAGS =  -m64
-++ LDFLAGS =  -link -m64
+++ LDFLAGS =  -link -m64 -gencode arch=compute_52,code=compute_52 -gencode arch=compute_52,code=sm_52
 
 ---------------------------------------------
 t_build/examples-x86_64-linux-gcc.mk:
 ---------------------------------------------
 -- LD=g++
 ++ LD=/usr/local/cuda-8.0/bin/nvcc
+
+-- LDFLAGS =  -m64
+++ LDFLAGS =  -link -m64 -gencode arch=compute_52,code=compute_52 -gencode arch=compute_52,code=sm_52
 
 --------------------------------------
 t_build/Makefile:
