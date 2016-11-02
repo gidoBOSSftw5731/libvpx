@@ -226,6 +226,10 @@ typedef struct {
   unsigned int periodicity;
   unsigned int layer_id[VPX_TS_MAX_PERIODICITY];
 
+#if HAVE_CUDA_ENABLED_DEVICE
+  int cuda_me_enabled;
+#endif
+
 #if CONFIG_MULTI_RES_ENCODING
   /* Number of total resolutions encoded */
   unsigned int mr_total_resolutions;
