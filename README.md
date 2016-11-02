@@ -27,7 +27,7 @@ make
 command would ideally be enough for compiling and linking.
 
 Note that NVidia nvcc must be present in the system under the directory:
-/usr/local/cuda-7.5/bin/
+/usr/local/cuda-8.0/bin/
 otherwise the files
 ```
 test_build/libs-x86_64-linux-gcc.mk
