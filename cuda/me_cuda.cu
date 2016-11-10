@@ -329,8 +329,9 @@ void me_cuda_launch_interleaved_fast( VP8_COMMON * const cm, int fb_idx, int ref
 	// for printing informations about reference frame flags and thei usage, I left a commented prinft at line 3625
 	// at the beginning of encode_frame_to_data_rate(..) in onyx_if.c
 
-	for (int s = 0; s < cm->GPU.num_mb16th; s++) {
+	for (int t = 0; t < cm->GPU.num_mb16th; t++) {
 
+		int s = cm->GPU.streamLaunchOrder[t];
 		//int offset = 16*s;
 		int offset = cm->GPU.streamSize * s;
 		// bugfix per immagini il cui n di mb non e' divisibile per 16
@@ -366,8 +367,9 @@ void me_cuda_launch_not_interleaved_fast( VP8_COMMON * const cm, int fb_idx, int
 	// for printing informations about reference frame flags and thei usage, I left a commented prinft at line 3625
 	// at the beginning of encode_frame_to_data_rate(..) in onyx_if.c
 
-	for (int s = 0; s < cm->GPU.num_mb16th; s++) {
+	for (int t = 0; t < cm->GPU.num_mb16th; t++) {
 
+		int s = cm->GPU.streamLaunchOrder[t];
 		//int offset = 16*s;
 		int offset = cm->GPU.streamSize * s;
 		// bugfix per immagini il cui n di mb non e' divisibile per 16
