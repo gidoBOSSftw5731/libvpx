@@ -493,8 +493,8 @@ void me_cuda_launch_interleaved_split( VP8_COMMON * const cm, int fb_idx, int re
 		int offset = cm->GPU.streamSize * s;
 		// bugfix per immagini il cui n di mb non e' divisibile per 16
 		// prima venivano lanciati troppi processi e cudaMemcpyAsync andava a leggere oltre i limiti degli array
-		if (offset + 16 > cm->gpu_frame.num_mv)
-			MV_size_16 = ( offset + 16 - cm->gpu_frame.num_mv ) * sizeof( int_mv );
+		if (offset + cm->GPU.streamSize > cm->gpu_frame.num_mv)
+			MV_size_16 = ( offset + cm->GPU.streamSize - cm->gpu_frame.num_mv ) * sizeof( int_mv );
 
 
 		if ((ref_frame_flags & GPUFLAG_LAST_FRAME) && (cm->yv12_fb[cm->lst_fb_idx].flags & GPUFLAG_LAST_FRAME)) {
@@ -532,8 +532,8 @@ void me_cuda_launch_not_interleaved_split( VP8_COMMON * const cm, int fb_idx, in
 		int offset = cm->GPU.streamSize * s;
 		// bugfix per immagini il cui n di mb non e' divisibile per 16
 		// prima venivano lanciati troppi processi e cudaMemcpyAsync andava a leggere oltre i limiti degli array
-		if (offset + 16 > cm->gpu_frame.num_mv)
-			MV_size_16 = ( offset + 16 - cm->gpu_frame.num_mv ) * sizeof( int_mv );
+		if (offset + cm->GPU.streamSize > cm->gpu_frame.num_mv)
+			MV_size_16 = ( offset + cm->GPU.streamSize - cm->gpu_frame.num_mv ) * sizeof( int_mv );
 
 
 		if ((ref_frame_flags & GPUFLAG_LAST_FRAME) && (cm->yv12_fb[cm->lst_fb_idx].flags & GPUFLAG_LAST_FRAME))

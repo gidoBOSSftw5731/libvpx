@@ -90,13 +90,14 @@ void GPU_setup( GPU_config_t * GPU_config, int gpu_frame_width, int gpu_frame_he
 	GPU_config->streamSize = W16th * 2;		// Ogni riga e' presa in carico da uno stream. Per ora.
 	//int num_mb16th = ceil(H16th*W16th/16.0);
 	//int num_mb16th = ceil((H16th*W16th)/(float)W16th);
-	int num_mb16th = ceil( H16th * W16th / GPU_config->streamSize );
+	int num_mb16th = ceil( H16th * W16th / (float)GPU_config->streamSize );
 
 	// stream creation
 	GPU_config->streams.frame     = (cudaStream_t *)malloc( num_mb16th * sizeof(cudaStream_t) );
 	GPU_config->streamLaunchOrder = (int *)malloc( num_mb16th * sizeof(int) );
 	for (int i = 0; i < num_mb16th; i++) {
 		CHECK(cudaStreamCreateWithFlags( &(GPU_config->streams.frame[i]), cudaStreamNonBlocking ));
+		GPU_config->streamLaunchOrder[i] = i;
 	}
 	GPU_config->num_mb16th = num_mb16th;
 
