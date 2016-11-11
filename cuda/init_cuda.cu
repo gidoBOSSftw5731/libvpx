@@ -263,8 +263,6 @@ void GPU_destroy( VP8_COMMON *cm ) {
 
 void GPUstreamReorder( VP8_COMMON * const cm ) {
 	int nStreams  = cm->GPU.num_mb16th;
-	if (cm->GPU.streamLaunchOrder == NULL)
-		printf("Oh, the humanity!\n");
 	int * strm    = cm->GPU.streamLaunchOrder;
 	int mbW       = cm->gpu_frame.num_MB_width;
 	int mbH       = cm->gpu_frame.num_MB_height;
@@ -275,11 +273,22 @@ void GPUstreamReorder( VP8_COMMON * const cm ) {
 	int multip = mbW / streamSz;					// Numero di stream interessati da un CPU thread
 	int streamPacket = (mbW * nthreads) / streamSz;	// Numero di stream interessati da tutti i CPU thread
 
-	for (int i = 0; i < ceil( mbH / (float)nthreads ); i++) {
-		for (int k = 0; k < streamPacket; k++) {
-			if (id < nStreams)
-				strm[id++] = (k * multip) % streamPacket + k / nthreads + i * streamPacket;
+	if (streamSz <= mbW) {
+		int i;
+		for (i = 0; i < ceil( mbH / (float)nthreads ); i++) {
+			if (((i + 1) * streamPacket) > nStreams)	// gestisce ultimo pacchettino di stream [vedi sotto]
+				break;
+			for (int k = 0; k < streamPacket; k++) {
+				if (id < nStreams)
+					strm[id++] = (k * multip) % streamPacket + k / nthreads + i * streamPacket;
+			}
 		}
+		for (int k = i * streamPacket; k < nStreams; k++)	// Stream avanzati, assegnati sequenzialmente
+			strm[id] = id++;
+
+	} else {
+		for (int i = 0; i < nStreams; i++)
+			strm[i] = i;
 	}
 	printf( "nstreams = %d  --  id = %d\n", nStreams, id );
 	for (int i = 0; i < nStreams; i++)

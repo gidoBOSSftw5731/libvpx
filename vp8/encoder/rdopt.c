@@ -2209,7 +2209,6 @@ void vp8_rd_pick_inter_mode(VP8_COMP *cpi, MACROBLOCK *x, int recon_yoffset,
 				//streamID = (mb_row * cpi->common.gpu_frame.num_MB_width + mb_col) >> 4;     // streamID to sync
                 //streamID = mb_row;
                 streamID = (mb_row * cpi->common.gpu_frame.num_MB_width + mb_col) / cpi->common.GPU.streamSize;
-                //sprintf("streamId: %d\n", streamID);
 				GPU_sync_stream_frame(&(cpi->common), streamID);      // sync on next stream
 				mb_offset = mb_row*cpi->common.mb_cols+mb_col;
 
