@@ -830,6 +830,14 @@ void vp8_pick_inter_mode(VP8_COMP *cpi, MACROBLOCK *x, int recon_yoffset,
   *returnintra = INT_MAX;
   x->skip = 0;
 
+  #if HAVE_CUDA_ENABLED_DEVICE
+      if (cpi->oxcf.cuda_me_enabled == ME_FAST_KERNEL) {
+      	x->rd_threshes[16] = INT_MAX;
+  		x->rd_threshes[17] = INT_MAX;
+  		x->rd_threshes[18] = INT_MAX;
+      }
+  #endif
+
   x->e_mbd.mode_info_context->mbmi.ref_frame = INTRA_FRAME;
 
   /* If the frame has big static background and current MB is in low
@@ -852,14 +860,6 @@ void vp8_pick_inter_mode(VP8_COMP *cpi, MACROBLOCK *x, int recon_yoffset,
     // Bias against ZEROMV_LAST mode.
     rd_adjustment = 150;
   }
-
-  #if HAVE_CUDA_ENABLED_DEVICE
-      if(cpi->oxcf.cuda_me_enabled == ME_FAST_KERNEL) {
-  		x->rd_threshes[16] = INT_MAX;
-  		x->rd_threshes[17] = INT_MAX;
-  		x->rd_threshes[18] = INT_MAX;
-      }
-  #endif
 
   /* if we encode a new mv this is important
    * find the best new motion vector
@@ -1180,7 +1180,8 @@ void vp8_pick_inter_mode(VP8_COMP *cpi, MACROBLOCK *x, int recon_yoffset,
                 unsigned char *z;
                 int_mv mv_from_gpu;
 
-				streamID = (mb_row * cpi->common.gpu_frame.num_MB_width+mb_col) >> 4;     // streamID to sync
+				//streamID = (mb_row * cpi->common.gpu_frame.num_MB_width+mb_col) >> 4;     // streamID to sync
+                streamID = (mb_row * cpi->common.gpu_frame.num_MB_width + mb_col) / cpi->common.GPU.streamSize;
 				GPU_sync_stream_frame(&(cpi->common), streamID);      // sync on next stream
 				mb_offset = mb_row*cpi->common.mb_cols+mb_col;
 
