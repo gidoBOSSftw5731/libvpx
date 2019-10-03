@@ -8,6 +8,7 @@
 ##  be found in the AUTHORS file in the root of the source tree.
 ##
 
+CUDA_INCLUDE_PATH=/usr/local/cuda/include
 
 include config.mk
 quiet?=true
@@ -65,9 +66,9 @@ include $(target)-$(TOOLCHAIN).mk
 endif
 BUILD_ROOT?=.
 VPATH=$(SRC_PATH_BARE)
-CFLAGS+=-I$(BUILD_PFX)$(BUILD_ROOT) -I$(SRC_PATH) -I/usr/local/cuda-8.0/include
-CXXFLAGS+=-I$(BUILD_PFX)$(BUILD_ROOT) -I$(SRC_PATH) -I/usr/local/cuda-8.0/include
-CXXCUDAFLAGS+=-I$(BUILD_PFX)$(BUILD_ROOT) -I$(SRC_PATH) -I/usr/local/cuda-8.0/include
+CFLAGS+=-I$(BUILD_PFX)$(BUILD_ROOT) -I$(SRC_PATH) -I$(CUDA_INCLUDE_PATH)
+CXXFLAGS+=-I$(BUILD_PFX)$(BUILD_ROOT) -I$(SRC_PATH) -I$(CUDA_INCLUDE_PATH)
+CXXCUDAFLAGS+=-I$(BUILD_PFX)$(BUILD_ROOT) -I$(SRC_PATH) -I$(CUDA_INCLUDE_PATH)
 ASFLAGS+=-I$(BUILD_PFX)$(BUILD_ROOT)/ -I$(SRC_PATH)/
 DIST_DIR?=dist
 HOSTCC?=gcc

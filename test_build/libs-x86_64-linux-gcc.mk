@@ -14,12 +14,12 @@ ASM_CONVERSION=../build/make/ads2gas.pl
 GEN_VCPROJ=
 MSVS_ARCH_DIR=
 
-CXXCUDA=/usr/local/cuda-8.0/bin/nvcc
+CXXCUDA=/usr/local/cuda/bin/nvcc
 
 CC=gcc
 CXX=g++
 AR=ar
-LD=/usr/local/cuda-8.0/bin/nvcc
+LD=/usr/local/cuda/bin/nvcc
 AS=yasm
 STRIP=strip
 NM=nm
