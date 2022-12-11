@@ -7,8 +7,10 @@
 *.o
 *~
 .cproject
+.idea
 .project
 .settings
+.vscode
 /*-*.mk
 /*.asm
 /*.doxy
@@ -20,6 +22,7 @@
 /.install-*
 /.libs
 /Makefile
+/arm_neon.h
 /config.log
 /config.mk
 /docs/

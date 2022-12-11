@@ -314,7 +314,7 @@ static void calc_iframe_target_size(VP8_COMP *cpi) {
      * bandwidth per second * fraction of the initial buffer
      * level
      */
-    target = cpi->oxcf.starting_buffer_level / 2;
+    target = (uint64_t)cpi->oxcf.starting_buffer_level / 2;
 
     if (target > cpi->oxcf.target_bandwidth * 3 / 2) {
       target = cpi->oxcf.target_bandwidth * 3 / 2;
@@ -327,7 +327,8 @@ static void calc_iframe_target_size(VP8_COMP *cpi) {
     int initial_boost = 32; /* |3.0 * per_frame_bandwidth| */
     /* Boost depends somewhat on frame rate: only used for 1 layer case. */
     if (cpi->oxcf.number_of_layers == 1) {
-      kf_boost = VPXMAX(initial_boost, (int)(2 * cpi->output_framerate - 16));
+      kf_boost =
+          VPXMAX(initial_boost, (int)round(2 * cpi->output_framerate - 16));
     } else {
       /* Initial factor: set target size to: |3.0 * per_frame_bandwidth|. */
       kf_boost = initial_boost;
@@ -349,15 +350,19 @@ static void calc_iframe_target_size(VP8_COMP *cpi) {
   }
 
   if (cpi->oxcf.rc_max_intra_bitrate_pct) {
-    unsigned int max_rate =
-        cpi->per_frame_bandwidth * cpi->oxcf.rc_max_intra_bitrate_pct / 100;
+    unsigned int max_rate;
+    // This product may overflow unsigned int
+    uint64_t product = cpi->per_frame_bandwidth;
+    product *= cpi->oxcf.rc_max_intra_bitrate_pct;
+    product /= 100;
+    max_rate = (unsigned int)VPXMIN(INT_MAX, product);
 
     if (target > max_rate) target = max_rate;
   }
 
   cpi->this_frame_target = (int)target;
 
-  /* TODO: if we separate rate targeting from Q targetting, move this.
+  /* TODO: if we separate rate targeting from Q targeting, move this.
    * Reset the active worst quality to the baseline value for key frames.
    */
   if (cpi->pass != 2) cpi->active_worst_quality = cpi->worst_quality;
@@ -498,11 +503,9 @@ static void calc_gf_params(VP8_COMP *cpi) {
    * This is updated once the real frame size/boost is known.
    */
   if (cpi->oxcf.fixed_q == -1) {
-    if (cpi->pass == 2) /* 2 Pass */
-    {
+    if (cpi->pass == 2) { /* 2 Pass */
       cpi->frames_till_gf_update_due = cpi->baseline_gf_interval;
-    } else /* 1 Pass */
-    {
+    } else { /* 1 Pass */
       cpi->frames_till_gf_update_due = cpi->baseline_gf_interval;
 
       if (cpi->last_boost > 750) cpi->frames_till_gf_update_due++;
@@ -778,6 +781,7 @@ static void calc_pframe_target_size(VP8_COMP *cpi) {
         }
       } else {
         int percent_high = 0;
+        int64_t target = cpi->this_frame_target;
 
         if ((cpi->oxcf.end_usage == USAGE_STREAM_FROM_SERVER) &&
             (cpi->buffer_level > cpi->oxcf.optimal_buffer_level)) {
@@ -795,7 +799,9 @@ static void calc_pframe_target_size(VP8_COMP *cpi) {
           percent_high = 0;
         }
 
-        cpi->this_frame_target += (cpi->this_frame_target * percent_high) / 200;
+        target += (target * percent_high) / 200;
+        target = VPXMIN(target, INT_MAX);
+        cpi->this_frame_target = (int)target;
 
         /* Are we allowing control of active_worst_allowed_q according
          * to buffer level.
@@ -998,7 +1004,7 @@ static void calc_pframe_target_size(VP8_COMP *cpi) {
            * bits on this frame even if it is a contructed arf.
            * The active maximum quantizer insures that an appropriate
            * number of bits will be spent if needed for contstructed ARFs.
-          */
+           */
           cpi->this_frame_target = 0;
         }
 
@@ -1054,9 +1060,8 @@ void vp8_update_rate_correction_factors(VP8_COMP *cpi, int damp_var) {
    * overflow when values are large
    */
   projected_size_based_on_q =
-      (int)(((.5 +
-              rate_correction_factor *
-                  vp8_bits_per_mb[cpi->common.frame_type][Q]) *
+      (int)(((.5 + rate_correction_factor *
+                       vp8_bits_per_mb[cpi->common.frame_type][Q]) *
              cpi->common.MBs) /
             (1 << BPER_MB_NORMBITS));
 
@@ -1077,8 +1082,8 @@ void vp8_update_rate_correction_factors(VP8_COMP *cpi, int damp_var) {
 
   /* Work out a size correction factor. */
   if (projected_size_based_on_q > 0) {
-    correction_factor =
-        (100 * cpi->projected_frame_size) / projected_size_based_on_q;
+    correction_factor = (int)((100 * (int64_t)cpi->projected_frame_size) /
+                              projected_size_based_on_q);
   }
 
   /* More heavily damped adjustment used if we have been oscillating
@@ -1126,6 +1131,14 @@ void vp8_update_rate_correction_factors(VP8_COMP *cpi, int damp_var) {
       cpi->rate_correction_factor = rate_correction_factor;
     }
   }
+}
+
+static int limit_q_cbr_inter(int last_q, int current_q) {
+  int limit_down = 12;
+  if (last_q - current_q > limit_down)
+    return (last_q - limit_down);
+  else
+    return current_q;
 }
 
 int vp8_regulate_q(VP8_COMP *cpi, int target_bits_per_frame) {
@@ -1267,6 +1280,12 @@ int vp8_regulate_q(VP8_COMP *cpi, int target_bits_per_frame) {
     }
   }
 
+  // Limit decrease in Q for 1 pass CBR screen content mode.
+  if (cpi->common.frame_type != KEY_FRAME && cpi->pass == 0 &&
+      cpi->oxcf.end_usage == USAGE_STREAM_FROM_SERVER &&
+      cpi->oxcf.screen_content_mode)
+    Q = limit_q_cbr_inter(cpi->last_q[1], Q);
+
   return Q;
 }
 
@@ -1364,14 +1383,17 @@ void vp8_compute_frame_size_bounds(VP8_COMP *cpi, int *frame_under_shoot_limit,
     *frame_under_shoot_limit = 0;
     *frame_over_shoot_limit = INT_MAX;
   } else {
+    const int64_t this_frame_target = cpi->this_frame_target;
+    int64_t over_shoot_limit, under_shoot_limit;
+
     if (cpi->common.frame_type == KEY_FRAME) {
-      *frame_over_shoot_limit = cpi->this_frame_target * 9 / 8;
-      *frame_under_shoot_limit = cpi->this_frame_target * 7 / 8;
+      over_shoot_limit = this_frame_target * 9 / 8;
+      under_shoot_limit = this_frame_target * 7 / 8;
     } else {
       if (cpi->oxcf.number_of_layers > 1 || cpi->common.refresh_alt_ref_frame ||
           cpi->common.refresh_golden_frame) {
-        *frame_over_shoot_limit = cpi->this_frame_target * 9 / 8;
-        *frame_under_shoot_limit = cpi->this_frame_target * 7 / 8;
+        over_shoot_limit = this_frame_target * 9 / 8;
+        under_shoot_limit = this_frame_target * 7 / 8;
       } else {
         /* For CBR take buffer fullness into account */
         if (cpi->oxcf.end_usage == USAGE_STREAM_FROM_SERVER) {
@@ -1381,18 +1403,18 @@ void vp8_compute_frame_size_bounds(VP8_COMP *cpi, int *frame_under_shoot_limit,
             /* Buffer is too full so relax overshoot and tighten
              * undershoot
              */
-            *frame_over_shoot_limit = cpi->this_frame_target * 12 / 8;
-            *frame_under_shoot_limit = cpi->this_frame_target * 6 / 8;
+            over_shoot_limit = this_frame_target * 12 / 8;
+            under_shoot_limit = this_frame_target * 6 / 8;
           } else if (cpi->buffer_level <=
                      (cpi->oxcf.optimal_buffer_level >> 1)) {
             /* Buffer is too low so relax undershoot and tighten
              * overshoot
              */
-            *frame_over_shoot_limit = cpi->this_frame_target * 10 / 8;
-            *frame_under_shoot_limit = cpi->this_frame_target * 4 / 8;
+            over_shoot_limit = this_frame_target * 10 / 8;
+            under_shoot_limit = this_frame_target * 4 / 8;
           } else {
-            *frame_over_shoot_limit = cpi->this_frame_target * 11 / 8;
-            *frame_under_shoot_limit = cpi->this_frame_target * 5 / 8;
+            over_shoot_limit = this_frame_target * 11 / 8;
+            under_shoot_limit = this_frame_target * 5 / 8;
           }
         }
         /* VBR and CQ mode */
@@ -1402,11 +1424,11 @@ void vp8_compute_frame_size_bounds(VP8_COMP *cpi, int *frame_under_shoot_limit,
         else {
           /* Stron overshoot limit for constrained quality */
           if (cpi->oxcf.end_usage == USAGE_CONSTRAINED_QUALITY) {
-            *frame_over_shoot_limit = cpi->this_frame_target * 11 / 8;
-            *frame_under_shoot_limit = cpi->this_frame_target * 2 / 8;
+            over_shoot_limit = this_frame_target * 11 / 8;
+            under_shoot_limit = this_frame_target * 2 / 8;
           } else {
-            *frame_over_shoot_limit = cpi->this_frame_target * 11 / 8;
-            *frame_under_shoot_limit = cpi->this_frame_target * 5 / 8;
+            over_shoot_limit = this_frame_target * 11 / 8;
+            under_shoot_limit = this_frame_target * 5 / 8;
           }
         }
       }
@@ -1416,9 +1438,13 @@ void vp8_compute_frame_size_bounds(VP8_COMP *cpi, int *frame_under_shoot_limit,
      * (eg * 7/8) may be tiny make sure there is at least a minimum
      * range.
      */
-    *frame_over_shoot_limit += 200;
-    *frame_under_shoot_limit -= 200;
-    if (*frame_under_shoot_limit < 0) *frame_under_shoot_limit = 0;
+    over_shoot_limit += 200;
+    under_shoot_limit -= 200;
+    if (under_shoot_limit < 0) under_shoot_limit = 0;
+    if (under_shoot_limit > INT_MAX) under_shoot_limit = INT_MAX;
+    if (over_shoot_limit > INT_MAX) over_shoot_limit = INT_MAX;
+    *frame_under_shoot_limit = (int)under_shoot_limit;
+    *frame_over_shoot_limit = (int)over_shoot_limit;
   }
 }
 
@@ -1442,12 +1468,33 @@ int vp8_pick_frame_size(VP8_COMP *cpi) {
 // If this just encoded frame (mcomp/transform/quant, but before loopfilter and
 // pack_bitstream) has large overshoot, and was not being encoded close to the
 // max QP, then drop this frame and force next frame to be encoded at max QP.
-// Condition this on 1 pass CBR with screen content mode and frame dropper off.
+// Allow this for screen_content_mode = 2, or if drop frames is allowed.
 // TODO(marpan): Should do this exit condition during the encode_frame
 // (i.e., halfway during the encoding of the frame) to save cycles.
 int vp8_drop_encodedframe_overshoot(VP8_COMP *cpi, int Q) {
-  if (cpi->pass == 0 && cpi->oxcf.end_usage == USAGE_STREAM_FROM_SERVER &&
-      cpi->drop_frames_allowed == 0 && cpi->common.frame_type != KEY_FRAME) {
+  int force_drop_overshoot = 0;
+#if CONFIG_MULTI_RES_ENCODING
+  // Only check for dropping due to overshoot on the lowest stream.
+  // If the lowest stream of the multi-res encoding was dropped due to
+  // overshoot, then force dropping on all upper layer streams
+  // (mr_encoder_id > 0).
+  LOWER_RES_FRAME_INFO *low_res_frame_info =
+      (LOWER_RES_FRAME_INFO *)cpi->oxcf.mr_low_res_mode_info;
+  if (cpi->oxcf.mr_total_resolutions > 1 && cpi->oxcf.mr_encoder_id > 0) {
+    force_drop_overshoot = low_res_frame_info->is_frame_dropped_overshoot_maxqp;
+    if (!force_drop_overshoot) {
+      cpi->force_maxqp = 0;
+      cpi->frames_since_last_drop_overshoot++;
+      return 0;
+    }
+  }
+#endif
+  if (cpi->common.frame_type != KEY_FRAME &&
+      (cpi->oxcf.screen_content_mode == 2 ||
+       (cpi->drop_frames_allowed &&
+        (force_drop_overshoot ||
+         (cpi->rate_correction_factor < (8.0f * MIN_BPB_FACTOR) &&
+          cpi->frames_since_last_drop_overshoot > (int)cpi->framerate))))) {
     // Note: the "projected_frame_size" from encode_frame() only gives estimate
     // of mode/motion vector rate (in non-rd mode): so below we only require
     // that projected_frame_size is somewhat greater than per-frame-bandwidth,
@@ -1458,17 +1505,21 @@ int vp8_drop_encodedframe_overshoot(VP8_COMP *cpi, int Q) {
     // Rate threshold, in bytes.
     int thresh_rate = 2 * (cpi->av_per_frame_bandwidth >> 3);
     // Threshold for the average (over all macroblocks) of the pixel-sum
-    // residual error over 16x16 block. Should add QP dependence on threshold?
-    int thresh_pred_err_mb = (256 << 4);
+    // residual error over 16x16 block.
+    int thresh_pred_err_mb = (200 << 4);
     int pred_err_mb = (int)(cpi->mb.prediction_error / cpi->common.MBs);
-    if (Q < thresh_qp && cpi->projected_frame_size > thresh_rate &&
-        pred_err_mb > thresh_pred_err_mb) {
+    // Reduce/ignore thresh_rate if pred_err_mb much larger than its threshold,
+    // give more weight to pred_err metric for overshoot detection.
+    if (cpi->drop_frames_allowed && pred_err_mb > (thresh_pred_err_mb << 4))
+      thresh_rate = thresh_rate >> 3;
+    if ((Q < thresh_qp && cpi->projected_frame_size > thresh_rate &&
+         pred_err_mb > thresh_pred_err_mb &&
+         pred_err_mb > 2 * cpi->last_pred_err_mb) ||
+        force_drop_overshoot) {
+      unsigned int i;
       double new_correction_factor;
-      const int target_size = cpi->av_per_frame_bandwidth;
       int target_bits_per_mb;
-      // Drop this frame: advance frame counters, and set force_maxqp flag.
-      cpi->common.current_video_frame++;
-      cpi->frames_since_key++;
+      const int target_size = cpi->av_per_frame_bandwidth;
       // Flag to indicate we will force next frame to be encoded at max QP.
       cpi->force_maxqp = 1;
       // Reset the buffer levels.
@@ -1499,14 +1550,40 @@ int vp8_drop_encodedframe_overshoot(VP8_COMP *cpi, int Q) {
       if (cpi->rate_correction_factor > MAX_BPB_FACTOR) {
         cpi->rate_correction_factor = MAX_BPB_FACTOR;
       }
+      // Drop this frame: update frame counters.
+      cpi->common.current_video_frame++;
+      cpi->frames_since_key++;
+      cpi->temporal_pattern_counter++;
+      cpi->frames_since_last_drop_overshoot = 0;
+      if (cpi->oxcf.number_of_layers > 1) {
+        // Set max_qp and rate correction for all temporal layers if overshoot
+        // is detected.
+        for (i = 0; i < cpi->oxcf.number_of_layers; ++i) {
+          LAYER_CONTEXT *lc = &cpi->layer_context[i];
+          lc->force_maxqp = 1;
+          lc->frames_since_last_drop_overshoot = 0;
+          lc->rate_correction_factor = cpi->rate_correction_factor;
+        }
+      }
+#if CONFIG_MULTI_RES_ENCODING
+      if (cpi->oxcf.mr_total_resolutions > 1)
+        low_res_frame_info->is_frame_dropped_overshoot_maxqp = 1;
+#endif
       return 1;
-    } else {
-      cpi->force_maxqp = 0;
-      return 0;
     }
     cpi->force_maxqp = 0;
+    cpi->frames_since_last_drop_overshoot++;
+#if CONFIG_MULTI_RES_ENCODING
+    if (cpi->oxcf.mr_total_resolutions > 1)
+      low_res_frame_info->is_frame_dropped_overshoot_maxqp = 0;
+#endif
     return 0;
   }
   cpi->force_maxqp = 0;
+  cpi->frames_since_last_drop_overshoot++;
+#if CONFIG_MULTI_RES_ENCODING
+  if (cpi->oxcf.mr_total_resolutions > 1)
+    low_res_frame_info->is_frame_dropped_overshoot_maxqp = 0;
+#endif
   return 0;
 }

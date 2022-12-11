@@ -12,10 +12,12 @@
 #include "./vpx_scale_rtcd.h"
 #include "./vpx_dsp_rtcd.h"
 #include "./vp8_rtcd.h"
+#include "bitstream.h"
 #include "vp8/common/onyxc_int.h"
 #include "vp8/common/blockd.h"
 #include "onyx_int.h"
 #include "vp8/common/systemdependent.h"
+#include "vp8/common/vp8_skin_detection.h"
 #include "vp8/encoder/quantize.h"
 #include "vp8/common/alloccommon.h"
 #include "mcomp.h"
@@ -34,14 +36,23 @@
 #include "vp8/common/swapyv12buffer.h"
 #include "vp8/common/threading.h"
 #include "vpx_ports/system_state.h"
+#include "vpx_ports/vpx_once.h"
 #include "vpx_ports/vpx_timer.h"
-#if ARCH_ARM
+#include "vpx_util/vpx_write_yuv_frame.h"
+#if VPX_ARCH_ARM
 #include "vpx_ports/arm.h"
 #endif
 #if CONFIG_MULTI_RES_ENCODING
 #include "mr_dissim.h"
 #endif
 #include "encodeframe.h"
+#if CONFIG_MULTITHREAD
+#include "ethreading.h"
+#endif
+#include "picklpf.h"
+#if !CONFIG_REALTIME_ONLY
+#include "temporal_filter.h"
+#endif
 
 #if HAVE_CUDA_ENABLED_DEVICE
 #include "cuda/typedef_cuda.h"
@@ -56,27 +67,11 @@
 
 #if CONFIG_REALTIME_ONLY & CONFIG_ONTHEFLY_BITPACKING
 extern int vp8_update_coef_context(VP8_COMP *cpi);
-extern void vp8_update_coef_probs(VP8_COMP *cpi);
 #endif
 
-extern void vp8cx_pick_filter_level_fast(YV12_BUFFER_CONFIG *sd, VP8_COMP *cpi);
-extern void vp8cx_set_alt_lf_level(VP8_COMP *cpi, int filt_val);
-extern void vp8cx_pick_filter_level(YV12_BUFFER_CONFIG *sd, VP8_COMP *cpi);
-
-extern void vp8_deblock_frame(YV12_BUFFER_CONFIG *source,
-                              YV12_BUFFER_CONFIG *post, int filt_lvl,
-                              int low_var_thresh, int flag);
-extern void print_parms(VP8_CONFIG *ocf, char *filenam);
 extern unsigned int vp8_get_processor_freq();
-extern void print_tree_update_probs();
-extern int vp8cx_create_encoder_threads(VP8_COMP *cpi);
-extern void vp8cx_remove_encoder_threads(VP8_COMP *cpi);
-
-int vp8_estimate_entropy_savings(VP8_COMP *cpi);
 
 int vp8_calc_ss_err(YV12_BUFFER_CONFIG *source, YV12_BUFFER_CONFIG *dest);
-
-extern void vp8_temporal_filter_prepare_c(VP8_COMP *cpi, int distance);
 
 static void set_default_lf_deltas(VP8_COMP *cpi);
 
@@ -93,6 +88,9 @@ FILE *yuv_file;
 #ifdef OUTPUT_YUV_DENOISED
 FILE *yuv_denoised_file;
 #endif
+#ifdef OUTPUT_YUV_SKINMAP
+static FILE *yuv_skinmap_file = NULL;
+#endif
 
 #if 0
 FILE *framepsnr;
@@ -103,10 +101,6 @@ FILE *keyfile;
 #if 0
 extern int skip_true_count;
 extern int skip_false_count;
-#endif
-
-#ifdef VP8_ENTROPY_STATS
-extern int intra_mode_stats[10][10][10];
 #endif
 
 #ifdef SPEEDSTATS
@@ -196,7 +190,7 @@ static const unsigned char inter_minq[QINDEX_RANGE] = {
 extern FILE *vpxlogc;
 #endif
 
-static void save_layer_context(VP8_COMP *cpi) {
+void vp8_save_layer_context(VP8_COMP *cpi) {
   LAYER_CONTEXT *lc = &cpi->layer_context[cpi->current_layer];
 
   /* Save layer dependent coding state */
@@ -225,14 +219,17 @@ static void save_layer_context(VP8_COMP *cpi) {
   lc->inter_frame_target = cpi->inter_frame_target;
   lc->total_byte_count = cpi->total_byte_count;
   lc->filter_level = cpi->common.filter_level;
-
+  lc->frames_since_last_drop_overshoot = cpi->frames_since_last_drop_overshoot;
+  lc->force_maxqp = cpi->force_maxqp;
   lc->last_frame_percent_intra = cpi->last_frame_percent_intra;
+  lc->last_q[0] = cpi->last_q[0];
+  lc->last_q[1] = cpi->last_q[1];
 
   memcpy(lc->count_mb_ref_frame_usage, cpi->mb.count_mb_ref_frame_usage,
          sizeof(cpi->mb.count_mb_ref_frame_usage));
 }
 
-static void restore_layer_context(VP8_COMP *cpi, const int layer) {
+void vp8_restore_layer_context(VP8_COMP *cpi, const int layer) {
   LAYER_CONTEXT *lc = &cpi->layer_context[layer];
 
   /* Restore layer dependent coding state */
@@ -261,8 +258,11 @@ static void restore_layer_context(VP8_COMP *cpi, const int layer) {
   cpi->inter_frame_target = lc->inter_frame_target;
   cpi->total_byte_count = lc->total_byte_count;
   cpi->common.filter_level = lc->filter_level;
-
+  cpi->frames_since_last_drop_overshoot = lc->frames_since_last_drop_overshoot;
+  cpi->force_maxqp = lc->force_maxqp;
   cpi->last_frame_percent_intra = lc->last_frame_percent_intra;
+  cpi->last_q[0] = lc->last_q[0];
+  cpi->last_q[1] = lc->last_q[1];
 
   memcpy(cpi->mb.count_mb_ref_frame_usage, lc->count_mb_ref_frame_usage,
          sizeof(cpi->mb.count_mb_ref_frame_usage));
@@ -276,9 +276,9 @@ static int rescale(int val, int num, int denom) {
   return (int)(llval * llnum / llden);
 }
 
-static void init_temporal_layer_context(VP8_COMP *cpi, VP8_CONFIG *oxcf,
-                                        const int layer,
-                                        double prev_layer_framerate) {
+void vp8_init_temporal_layer_context(VP8_COMP *cpi, VP8_CONFIG *oxcf,
+                                     const int layer,
+                                     double prev_layer_framerate) {
   LAYER_CONTEXT *lc = &cpi->layer_context[layer];
 
   lc->framerate = cpi->output_framerate / cpi->oxcf.rate_decimator[layer];
@@ -308,9 +308,9 @@ static void init_temporal_layer_context(VP8_COMP *cpi, VP8_CONFIG *oxcf,
   /* Work out the average size of a frame within this layer */
   if (layer > 0) {
     lc->avg_frame_size_for_layer =
-        (int)((cpi->oxcf.target_bitrate[layer] -
-               cpi->oxcf.target_bitrate[layer - 1]) *
-              1000 / (lc->framerate - prev_layer_framerate));
+        (int)round((cpi->oxcf.target_bitrate[layer] -
+                    cpi->oxcf.target_bitrate[layer - 1]) *
+                   1000 / (lc->framerate - prev_layer_framerate));
   }
 
   lc->active_worst_quality = cpi->oxcf.worst_allowed_q;
@@ -334,8 +334,8 @@ static void init_temporal_layer_context(VP8_COMP *cpi, VP8_CONFIG *oxcf,
 // for any "new" layers. For "existing" layers, let them inherit the parameters
 // from the previous layer state (at the same layer #). In future we may want
 // to better map the previous layer state(s) to the "new" ones.
-static void reset_temporal_layer_change(VP8_COMP *cpi, VP8_CONFIG *oxcf,
-                                        const int prev_num_layers) {
+void vp8_reset_temporal_layer_change(VP8_COMP *cpi, VP8_CONFIG *oxcf,
+                                     const int prev_num_layers) {
   int i;
   double prev_layer_framerate = 0;
   const int curr_num_layers = cpi->oxcf.number_of_layers;
@@ -343,12 +343,12 @@ static void reset_temporal_layer_change(VP8_COMP *cpi, VP8_CONFIG *oxcf,
   // We need this to set the layer context for the new layers below.
   if (prev_num_layers == 1) {
     cpi->current_layer = 0;
-    save_layer_context(cpi);
+    vp8_save_layer_context(cpi);
   }
   for (i = 0; i < curr_num_layers; ++i) {
     LAYER_CONTEXT *lc = &cpi->layer_context[i];
     if (i >= prev_num_layers) {
-      init_temporal_layer_context(cpi, oxcf, i, prev_layer_framerate);
+      vp8_init_temporal_layer_context(cpi, oxcf, i, prev_layer_framerate);
     }
     // The initial buffer levels are set based on their starting levels.
     // We could set the buffer levels based on the previous state (normalized
@@ -363,7 +363,7 @@ static void reset_temporal_layer_change(VP8_COMP *cpi, VP8_CONFIG *oxcf,
     // state (to smooth-out quality dips/rate fluctuation at transition)?
 
     // We need to treat the 1 layer case separately: oxcf.target_bitrate[i]
-    // is not set for 1 layer, and the restore_layer_context/save_context()
+    // is not set for 1 layer, and the vp8_restore_layer_context/save_context()
     // are not called in the encoding loop, so we need to call it here to
     // pass the layer context state to |cpi|.
     if (curr_num_layers == 1) {
@@ -371,7 +371,7 @@ static void reset_temporal_layer_change(VP8_COMP *cpi, VP8_CONFIG *oxcf,
       lc->buffer_level =
           cpi->oxcf.starting_buffer_level_in_ms * lc->target_bandwidth / 1000;
       lc->bits_off_target = lc->buffer_level;
-      restore_layer_context(cpi, 0);
+      vp8_restore_layer_context(cpi, 0);
     }
     prev_layer_framerate = cpi->output_framerate / cpi->oxcf.rate_decimator[i];
   }
@@ -401,15 +401,12 @@ static void setup_features(VP8_COMP *cpi) {
 
 static void dealloc_raw_frame_buffers(VP8_COMP *cpi);
 
-void vp8_initialize_enc(void) {
-  static volatile int init_done = 0;
-
-  if (!init_done) {
-    vpx_dsp_rtcd();
-    vp8_init_intra_predictors();
-    init_done = 1;
-  }
+static void initialize_enc(void) {
+  vpx_dsp_rtcd();
+  vp8_init_intra_predictors();
 }
+
+void vp8_initialize_enc(void) { once(initialize_enc); }
 
 static void dealloc_compressor_data(VP8_COMP *cpi) {
   vpx_free(cpi->tplist);
@@ -610,6 +607,59 @@ static void cyclic_background_refresh(VP8_COMP *cpi, int Q, int lf_adjustment) {
   set_segment_data(cpi, &feature_data[0][0], SEGMENT_DELTADATA);
 }
 
+static void compute_skin_map(VP8_COMP *cpi) {
+  int mb_row, mb_col, num_bl;
+  VP8_COMMON *cm = &cpi->common;
+  const uint8_t *src_y = cpi->Source->y_buffer;
+  const uint8_t *src_u = cpi->Source->u_buffer;
+  const uint8_t *src_v = cpi->Source->v_buffer;
+  const int src_ystride = cpi->Source->y_stride;
+  const int src_uvstride = cpi->Source->uv_stride;
+
+  const SKIN_DETECTION_BLOCK_SIZE bsize =
+      (cm->Width * cm->Height <= 352 * 288) ? SKIN_8X8 : SKIN_16X16;
+
+  for (mb_row = 0; mb_row < cm->mb_rows; mb_row++) {
+    num_bl = 0;
+    for (mb_col = 0; mb_col < cm->mb_cols; mb_col++) {
+      const int bl_index = mb_row * cm->mb_cols + mb_col;
+      cpi->skin_map[bl_index] =
+          vp8_compute_skin_block(src_y, src_u, src_v, src_ystride, src_uvstride,
+                                 bsize, cpi->consec_zero_last[bl_index], 0);
+      num_bl++;
+      src_y += 16;
+      src_u += 8;
+      src_v += 8;
+    }
+    src_y += (src_ystride << 4) - (num_bl << 4);
+    src_u += (src_uvstride << 3) - (num_bl << 3);
+    src_v += (src_uvstride << 3) - (num_bl << 3);
+  }
+
+  // Remove isolated skin blocks (none of its neighbors are skin) and isolated
+  // non-skin blocks (all of its neighbors are skin). Skip the boundary.
+  for (mb_row = 1; mb_row < cm->mb_rows - 1; mb_row++) {
+    for (mb_col = 1; mb_col < cm->mb_cols - 1; mb_col++) {
+      const int bl_index = mb_row * cm->mb_cols + mb_col;
+      int num_neighbor = 0;
+      int mi, mj;
+      int non_skin_threshold = 8;
+
+      for (mi = -1; mi <= 1; mi += 1) {
+        for (mj = -1; mj <= 1; mj += 1) {
+          int bl_neighbor_index = (mb_row + mi) * cm->mb_cols + mb_col + mj;
+          if (cpi->skin_map[bl_neighbor_index]) num_neighbor++;
+        }
+      }
+
+      if (cpi->skin_map[bl_index] && num_neighbor < 2)
+        cpi->skin_map[bl_index] = 0;
+      if (!cpi->skin_map[bl_index] && num_neighbor == non_skin_threshold)
+        cpi->skin_map[bl_index] = 1;
+    }
+  }
+}
+
 static void set_default_lf_deltas(VP8_COMP *cpi) {
   cpi->mb.e_mbd.mode_ref_lf_delta_enabled = 1;
   cpi->mb.e_mbd.mode_ref_lf_delta_update = 1;
@@ -638,8 +688,8 @@ static void set_default_lf_deltas(VP8_COMP *cpi) {
 /* Convenience macros for mapping speed and mode into a continuous
  * range
  */
-#define GOOD(x) (x + 1)
-#define RT(x) (x + 7)
+#define GOOD(x) ((x) + 1)
+#define RT(x) ((x) + 7)
 
 static int speed_map(int speed, const int *map) {
   int res;
@@ -692,9 +742,9 @@ static const int mode_check_freq_map_zn2[] = {
   0, RT(10), 1 << 1, RT(11), 1 << 2, RT(12), 1 << 3, INT_MAX
 };
 
-static const int mode_check_freq_map_vhbpred[] = {
-  0, GOOD(5), 2, RT(0), 0, RT(3), 2, RT(5), 4, INT_MAX
-};
+static const int mode_check_freq_map_vhbpred[] = { 0, GOOD(5), 2, RT(0),
+                                                   0, RT(3),   2, RT(5),
+                                                   4, INT_MAX };
 
 static const int mode_check_freq_map_near2[] = {
   0,      GOOD(5), 2,      RT(0),  0,      RT(3),  2,
@@ -710,18 +760,19 @@ static const int mode_check_freq_map_new2[] = { 0,      GOOD(5), 4,      RT(0),
                                                 1 << 3, RT(11),  1 << 4, RT(12),
                                                 1 << 5, INT_MAX };
 
-static const int mode_check_freq_map_split1[] = {
-  0, GOOD(2), 2, GOOD(3), 7, RT(1), 2, RT(2), 7, INT_MAX
-};
+static const int mode_check_freq_map_split1[] = { 0, GOOD(2), 2, GOOD(3),
+                                                  7, RT(1),   2, RT(2),
+                                                  7, INT_MAX };
 
-static const int mode_check_freq_map_split2[] = {
-  0, GOOD(1), 2, GOOD(2), 4, GOOD(3), 15, RT(1), 4, RT(2), 15, INT_MAX
-};
+static const int mode_check_freq_map_split2[] = { 0, GOOD(1), 2,  GOOD(2),
+                                                  4, GOOD(3), 15, RT(1),
+                                                  4, RT(2),   15, INT_MAX };
 
 void vp8_set_speed_features(VP8_COMP *cpi) {
   SPEED_FEATURES *sf = &cpi->sf;
   int Mode = cpi->compressor_speed;
   int Speed = cpi->Speed;
+  int Speed2;
   int i;
   VP8_COMMON *cm = &cpi->common;
   int last_improved_quant = sf->improved_quant;
@@ -823,9 +874,16 @@ void vp8_set_speed_features(VP8_COMP *cpi) {
   cpi->mode_check_freq[THR_V_PRED] = cpi->mode_check_freq[THR_H_PRED] =
       cpi->mode_check_freq[THR_B_PRED] =
           speed_map(Speed, mode_check_freq_map_vhbpred);
-  cpi->mode_check_freq[THR_NEW1] = speed_map(Speed, mode_check_freq_map_new1);
+
+  // For real-time mode at speed 10 keep the mode_check_freq threshold
+  // for NEW1 similar to that of speed 9.
+  Speed2 = Speed;
+  if (cpi->Speed == 10 && Mode == 2) Speed2 = RT(9);
+  cpi->mode_check_freq[THR_NEW1] = speed_map(Speed2, mode_check_freq_map_new1);
+
   cpi->mode_check_freq[THR_NEW2] = cpi->mode_check_freq[THR_NEW3] =
       speed_map(Speed, mode_check_freq_map_new2);
+
   cpi->mode_check_freq[THR_SPLIT1] =
       speed_map(Speed, mode_check_freq_map_split1);
   cpi->mode_check_freq[THR_SPLIT2] = cpi->mode_check_freq[THR_SPLIT3] =
@@ -969,7 +1027,7 @@ void vp8_set_speed_features(VP8_COMP *cpi) {
 
       memset(cpi->mb.error_bins, 0, sizeof(cpi->mb.error_bins));
 
-  }; /* switch */
+  } /* switch */
 
   /* Slow quant, dct and trellis not worthwhile for first pass
    * so make sure they are always turned off.
@@ -1171,9 +1229,13 @@ void vp8_alloc_compressor_data(VP8_COMP *cpi) {
   }
 
   if (cpi->oxcf.multi_threaded > 1) {
+    int i;
+
     vpx_free(cpi->mt_current_mb_col);
     CHECK_MEM_ERROR(cpi->mt_current_mb_col,
                     vpx_malloc(sizeof(*cpi->mt_current_mb_col) * cm->mb_rows));
+    for (i = 0; i < cm->mb_rows; ++i)
+      vpx_atomic_init(&cpi->mt_current_mb_col[i], 0);
   }
 
 #endif
@@ -1216,7 +1278,7 @@ void vp8_new_framerate(VP8_COMP *cpi, double framerate) {
   cpi->framerate = framerate;
   cpi->output_framerate = framerate;
   cpi->per_frame_bandwidth =
-      (int)(cpi->oxcf.target_bandwidth / cpi->output_framerate);
+      (int)round(cpi->oxcf.target_bandwidth / cpi->output_framerate);
   cpi->av_per_frame_bandwidth = cpi->per_frame_bandwidth;
   cpi->min_frame_bandwidth = (int)(cpi->av_per_frame_bandwidth *
                                    cpi->oxcf.two_pass_vbrmin_section / 100);
@@ -1307,7 +1369,7 @@ static void init_config(VP8_COMP *cpi, VP8_CONFIG *oxcf) {
     double prev_layer_framerate = 0;
 
     for (i = 0; i < cpi->oxcf.number_of_layers; ++i) {
-      init_temporal_layer_context(cpi, oxcf, i, prev_layer_framerate);
+      vp8_init_temporal_layer_context(cpi, oxcf, i, prev_layer_framerate);
       prev_layer_framerate =
           cpi->output_framerate / cpi->oxcf.rate_decimator[i];
     }
@@ -1324,7 +1386,7 @@ static void init_config(VP8_COMP *cpi, VP8_CONFIG *oxcf) {
 #endif
 }
 
-static void update_layer_contexts(VP8_COMP *cpi) {
+void vp8_update_layer_contexts(VP8_COMP *cpi) {
   VP8_CONFIG *oxcf = &cpi->oxcf;
 
   /* Update snapshots of the layer contexts to reflect new parameters */
@@ -1359,8 +1421,8 @@ static void update_layer_contexts(VP8_COMP *cpi) {
       /* Work out the average size of a frame within this layer */
       if (i > 0) {
         lc->avg_frame_size_for_layer =
-            (int)((oxcf->target_bitrate[i] - oxcf->target_bitrate[i - 1]) *
-                  1000 / (lc->framerate - prev_layer_framerate));
+            (int)round((oxcf->target_bitrate[i] - oxcf->target_bitrate[i - 1]) *
+                       1000 / (lc->framerate - prev_layer_framerate));
       }
 
       prev_layer_framerate = lc->framerate;
@@ -1372,6 +1434,7 @@ void vp8_change_config(VP8_COMP *cpi, VP8_CONFIG *oxcf) {
   VP8_COMMON *cm = &cpi->common;
   int last_w, last_h;
   unsigned int prev_number_of_layers;
+  unsigned int raw_target_rate;
 
   if (!cpi) return;
 
@@ -1471,6 +1534,8 @@ void vp8_change_config(VP8_COMP *cpi, VP8_CONFIG *oxcf) {
     }
   }
 
+  cpi->ext_refresh_frame_flags_pending = 0;
+
   cpi->baseline_gf_interval =
       cpi->oxcf.alt_freq ? cpi->oxcf.alt_freq : DEFAULT_GF_INTERVAL;
 
@@ -1490,9 +1555,8 @@ void vp8_change_config(VP8_COMP *cpi, VP8_CONFIG *oxcf) {
 
   setup_features(cpi);
 
-  {
+  if (!cpi->use_roi_static_threshold) {
     int i;
-
     for (i = 0; i < MAX_MB_SEGMENTS; ++i) {
       cpi->segment_encode_breakout[i] = cpi->oxcf.encode_breakout;
     }
@@ -1511,6 +1575,10 @@ void vp8_change_config(VP8_COMP *cpi, VP8_CONFIG *oxcf) {
     cpi->oxcf.maximum_buffer_size_in_ms = 240000;
   }
 
+  raw_target_rate = (unsigned int)((int64_t)cpi->oxcf.Width * cpi->oxcf.Height *
+                                   8 * 3 * cpi->framerate / 1000);
+  if (cpi->oxcf.target_bandwidth > raw_target_rate)
+    cpi->oxcf.target_bandwidth = raw_target_rate;
   /* Convert target bandwidth from Kbit/s to Bit/s */
   cpi->oxcf.target_bandwidth *= 1000;
 
@@ -1581,7 +1649,7 @@ void vp8_change_config(VP8_COMP *cpi, VP8_CONFIG *oxcf) {
       cpi->temporal_layer_id = 0;
     }
     cpi->temporal_pattern_counter = 0;
-    reset_temporal_layer_change(cpi, oxcf, prev_number_of_layers);
+    vp8_reset_temporal_layer_change(cpi, oxcf, prev_number_of_layers);
   }
 
   if (!cpi->initial_width) {
@@ -1606,8 +1674,7 @@ void vp8_change_config(VP8_COMP *cpi, VP8_CONFIG *oxcf) {
   cm->sharpness_level = cpi->oxcf.Sharpness;
 
   if (cm->horiz_scale != NORMAL || cm->vert_scale != NORMAL) {
-    int UNINITIALIZED_IS_SAFE(hr), UNINITIALIZED_IS_SAFE(hs);
-    int UNINITIALIZED_IS_SAFE(vr), UNINITIALIZED_IS_SAFE(vs);
+    int hr, hs, vr, vs;
 
     Scale2Ratio(cm->horiz_scale, &hr, &hs);
     Scale2Ratio(cm->vert_scale, &vr, &vs);
@@ -1753,6 +1820,8 @@ struct VP8_COMP *vp8_create_compressor(VP8_CONFIG *oxcf) {
 
   cpi->active_map_enabled = 0;
 
+  cpi->use_roi_static_threshold = 0;
+
 #if 0
     /* Experimental code for lagged and one pass */
     /* Initialise one_pass GF frames stats */
@@ -1822,14 +1891,13 @@ struct VP8_COMP *vp8_create_compressor(VP8_CONFIG *oxcf) {
     cpi->cyclic_refresh_map = (signed char *)NULL;
   }
 
+  CHECK_MEM_ERROR(cpi->skin_map, vpx_calloc(cm->mb_rows * cm->mb_cols,
+                                            sizeof(cpi->skin_map[0])));
+
   CHECK_MEM_ERROR(cpi->consec_zero_last,
                   vpx_calloc(cm->mb_rows * cm->mb_cols, 1));
   CHECK_MEM_ERROR(cpi->consec_zero_last_mvbias,
                   vpx_calloc((cpi->common.mb_rows * cpi->common.mb_cols), 1));
-
-#ifdef VP8_ENTROPY_STATS
-  init_context_counters();
-#endif
 
   /*Initialize the feed-forward activity masking.*/
   cpi->activity_avg = 90 << 12;
@@ -1845,6 +1913,8 @@ struct VP8_COMP *vp8_create_compressor(VP8_CONFIG *oxcf) {
   cpi->common.refresh_alt_ref_frame = 0;
 
   cpi->force_maxqp = 0;
+  cpi->frames_since_last_drop_overshoot = 0;
+  cpi->rt_always_update_correction_factor = 0;
 
   cpi->b_calculate_psnr = CONFIG_INTERNAL_STATS;
 #if CONFIG_INTERNAL_STATS
@@ -1898,6 +1968,9 @@ struct VP8_COMP *vp8_create_compressor(VP8_CONFIG *oxcf) {
 #ifdef OUTPUT_YUV_DENOISED
   yuv_denoised_file = fopen("denoised.yuv", "ab");
 #endif
+#ifdef OUTPUT_YUV_SKINMAP
+  yuv_skinmap_file = fopen("skinmap.yuv", "wb");
+#endif
 
 #if 0
     framepsnr = fopen("framepsnr.stt", "a");
@@ -1935,10 +2008,6 @@ struct VP8_COMP *vp8_create_compressor(VP8_CONFIG *oxcf) {
     cpi->mb.rd_thresh_mult[i] = 128;
   }
 
-#ifdef VP8_ENTROPY_STATS
-  init_mv_ref_counts();
-#endif
-
 #if CONFIG_MULTITHREAD
   if (vp8cx_create_encoder_threads(cpi)) {
     vp8_remove_compressor(&cpi);
@@ -1949,39 +2018,29 @@ struct VP8_COMP *vp8_create_compressor(VP8_CONFIG *oxcf) {
   cpi->fn_ptr[BLOCK_16X16].sdf = vpx_sad16x16;
   cpi->fn_ptr[BLOCK_16X16].vf = vpx_variance16x16;
   cpi->fn_ptr[BLOCK_16X16].svf = vpx_sub_pixel_variance16x16;
-  cpi->fn_ptr[BLOCK_16X16].sdx3f = vpx_sad16x16x3;
-  cpi->fn_ptr[BLOCK_16X16].sdx8f = vpx_sad16x16x8;
   cpi->fn_ptr[BLOCK_16X16].sdx4df = vpx_sad16x16x4d;
 
   cpi->fn_ptr[BLOCK_16X8].sdf = vpx_sad16x8;
   cpi->fn_ptr[BLOCK_16X8].vf = vpx_variance16x8;
   cpi->fn_ptr[BLOCK_16X8].svf = vpx_sub_pixel_variance16x8;
-  cpi->fn_ptr[BLOCK_16X8].sdx3f = vpx_sad16x8x3;
-  cpi->fn_ptr[BLOCK_16X8].sdx8f = vpx_sad16x8x8;
   cpi->fn_ptr[BLOCK_16X8].sdx4df = vpx_sad16x8x4d;
 
   cpi->fn_ptr[BLOCK_8X16].sdf = vpx_sad8x16;
   cpi->fn_ptr[BLOCK_8X16].vf = vpx_variance8x16;
   cpi->fn_ptr[BLOCK_8X16].svf = vpx_sub_pixel_variance8x16;
-  cpi->fn_ptr[BLOCK_8X16].sdx3f = vpx_sad8x16x3;
-  cpi->fn_ptr[BLOCK_8X16].sdx8f = vpx_sad8x16x8;
   cpi->fn_ptr[BLOCK_8X16].sdx4df = vpx_sad8x16x4d;
 
   cpi->fn_ptr[BLOCK_8X8].sdf = vpx_sad8x8;
   cpi->fn_ptr[BLOCK_8X8].vf = vpx_variance8x8;
   cpi->fn_ptr[BLOCK_8X8].svf = vpx_sub_pixel_variance8x8;
-  cpi->fn_ptr[BLOCK_8X8].sdx3f = vpx_sad8x8x3;
-  cpi->fn_ptr[BLOCK_8X8].sdx8f = vpx_sad8x8x8;
   cpi->fn_ptr[BLOCK_8X8].sdx4df = vpx_sad8x8x4d;
 
   cpi->fn_ptr[BLOCK_4X4].sdf = vpx_sad4x4;
   cpi->fn_ptr[BLOCK_4X4].vf = vpx_variance4x4;
   cpi->fn_ptr[BLOCK_4X4].svf = vpx_sub_pixel_variance4x4;
-  cpi->fn_ptr[BLOCK_4X4].sdx3f = vpx_sad4x4x3;
-  cpi->fn_ptr[BLOCK_4X4].sdx8f = vpx_sad4x4x8;
   cpi->fn_ptr[BLOCK_4X4].sdx4df = vpx_sad4x4x4d;
 
-#if ARCH_X86 || ARCH_X86_64
+#if VPX_ARCH_X86 || VPX_ARCH_X86_64
   cpi->fn_ptr[BLOCK_16X16].copymem = vp8_copy32xn;
   cpi->fn_ptr[BLOCK_16X8].copymem = vp8_copy32xn;
   cpi->fn_ptr[BLOCK_8X16].copymem = vp8_copy32xn;
@@ -1989,7 +2048,6 @@ struct VP8_COMP *vp8_create_compressor(VP8_CONFIG *oxcf) {
   cpi->fn_ptr[BLOCK_4X4].copymem = vp8_copy32xn;
 #endif
 
-  cpi->full_search_sad = vp8_full_search_sad;
   cpi->diamond_search_sad = vp8_diamond_search_sad;
   cpi->refining_search_sad = vp8_refining_search_sad;
 
@@ -2062,8 +2120,8 @@ struct VP8_COMP *vp8_create_compressor(VP8_CONFIG *oxcf) {
   return cpi;
 }
 
-void vp8_remove_compressor(VP8_COMP **ptr) {
-  VP8_COMP *cpi = *ptr;
+void vp8_remove_compressor(VP8_COMP **comp) {
+  VP8_COMP *cpi = *comp;
 
   if (!cpi) return;
 
@@ -2076,12 +2134,6 @@ void vp8_remove_compressor(VP8_COMP **ptr) {
 
 #endif
 
-#ifdef VP8_ENTROPY_STATS
-    print_context_counters();
-    print_tree_update_probs();
-    print_mode_context();
-#endif
-
 #if CONFIG_INTERNAL_STATS
 
     if (cpi->pass != 1) {
@@ -2089,11 +2141,7 @@ void vp8_remove_compressor(VP8_COMP **ptr) {
       double time_encoded =
           (cpi->last_end_time_stamp_seen - cpi->first_time_stamp_ever) /
           10000000.000;
-      double total_encode_time =
-          (cpi->time_receive_data + cpi->time_compress_data) / 1000.000;
       double dr = (double)cpi->bytes * 8.0 / 1000.0 / time_encoded;
-      const double target_rate = (double)cpi->oxcf.target_bandwidth / 1000;
-      const double rate_err = ((100.0 * (dr - target_rate)) / target_rate);
 
       if (cpi->b_calculate_psnr) {
         if (cpi->oxcf.number_of_layers > 1) {
@@ -2212,40 +2260,6 @@ void vp8_remove_compressor(VP8_COMP **ptr) {
     }
 #endif
 
-#ifdef VP8_ENTROPY_STATS
-    {
-      int i, j, k;
-      FILE *fmode = fopen("modecontext.c", "w");
-
-      fprintf(fmode, "\n#include \"entropymode.h\"\n\n");
-      fprintf(fmode, "const unsigned int vp8_kf_default_bmode_counts ");
-      fprintf(fmode,
-              "[VP8_BINTRAMODES] [VP8_BINTRAMODES] [VP8_BINTRAMODES] =\n{\n");
-
-      for (i = 0; i < 10; ++i) {
-        fprintf(fmode, "    { /* Above Mode :  %d */\n", i);
-
-        for (j = 0; j < 10; ++j) {
-          fprintf(fmode, "        {");
-
-          for (k = 0; k < 10; ++k) {
-            if (!intra_mode_stats[i][j][k])
-              fprintf(fmode, " %5d, ", 1);
-            else
-              fprintf(fmode, " %5d, ", intra_mode_stats[i][j][k]);
-          }
-
-          fprintf(fmode, "}, /* left_mode %d */\n", j);
-        }
-
-        fprintf(fmode, "    },\n");
-      }
-
-      fprintf(fmode, "};\n");
-      fclose(fmode);
-    }
-#endif
-
 #if defined(SECTIONBITS_OUTPUT)
 
     if (0) {
@@ -2279,6 +2293,7 @@ void vp8_remove_compressor(VP8_COMP **ptr) {
   dealloc_compressor_data(cpi);
   vpx_free(cpi->mb.ss);
   vpx_free(cpi->tok);
+  vpx_free(cpi->skin_map);
   vpx_free(cpi->cyclic_refresh_map);
   vpx_free(cpi->consec_zero_last);
   vpx_free(cpi->consec_zero_last_mvbias);
@@ -2293,13 +2308,16 @@ void vp8_remove_compressor(VP8_COMP **ptr) {
 
   vp8_remove_common(&cpi->common);
   vpx_free(cpi);
-  *ptr = 0;
+  *comp = 0;
 
 #ifdef OUTPUT_YUV_SRC
   fclose(yuv_file);
 #endif
 #ifdef OUTPUT_YUV_DENOISED
   fclose(yuv_denoised_file);
+#endif
+#ifdef OUTPUT_YUV_SKINMAP
+  fclose(yuv_skinmap_file);
 #endif
 
 #if 0
@@ -2428,6 +2446,7 @@ int vp8_update_reference(VP8_COMP *cpi, int ref_frame_flags) {
 
   if (ref_frame_flags & VP8_ALTR_FRAME) cpi->common.refresh_alt_ref_frame = 1;
 
+  cpi->ext_refresh_frame_flags_pending = 1;
   return 0;
 }
 
@@ -2477,42 +2496,13 @@ int vp8_update_entropy(VP8_COMP *cpi, int update) {
   return 0;
 }
 
-#if defined(OUTPUT_YUV_SRC) || defined(OUTPUT_YUV_DENOISED)
-void vp8_write_yuv_frame(FILE *yuv_file, YV12_BUFFER_CONFIG *s) {
-  unsigned char *src = s->y_buffer;
-  int h = s->y_height;
-
-  do {
-    fwrite(src, s->y_width, 1, yuv_file);
-    src += s->y_stride;
-  } while (--h);
-
-  src = s->u_buffer;
-  h = s->uv_height;
-
-  do {
-    fwrite(src, s->uv_width, 1, yuv_file);
-    src += s->uv_stride;
-  } while (--h);
-
-  src = s->v_buffer;
-  h = s->uv_height;
-
-  do {
-    fwrite(src, s->uv_width, 1, yuv_file);
-    src += s->uv_stride;
-  } while (--h);
-}
-#endif
-
 static void scale_and_extend_source(YV12_BUFFER_CONFIG *sd, VP8_COMP *cpi) {
   VP8_COMMON *cm = &cpi->common;
 
   /* are we resizing the image */
   if (cm->horiz_scale != 0 || cm->vert_scale != 0) {
 #if CONFIG_SPATIAL_RESAMPLING
-    int UNINITIALIZED_IS_SAFE(hr), UNINITIALIZED_IS_SAFE(hs);
-    int UNINITIALIZED_IS_SAFE(vr), UNINITIALIZED_IS_SAFE(vs);
+    int hr, hs, vr, vs;
     int tmp_height;
 
     if (cm->vert_scale == 3) {
@@ -2545,8 +2535,7 @@ static int resize_key_frame(VP8_COMP *cpi) {
    */
   if (cpi->oxcf.allow_spatial_resampling &&
       (cpi->oxcf.end_usage == USAGE_STREAM_FROM_SERVER)) {
-    int UNINITIALIZED_IS_SAFE(hr), UNINITIALIZED_IS_SAFE(hs);
-    int UNINITIALIZED_IS_SAFE(vr), UNINITIALIZED_IS_SAFE(vs);
+    int hr, hs, vr, vs;
     int new_width, new_height;
 
     /* If we are below the resample DOWN watermark then scale down a
@@ -2813,13 +2802,8 @@ static int decide_key_frame(VP8_COMP *cpi) {
   return code_key_frame;
 }
 
-static void Pass1Encode(VP8_COMP *cpi, size_t *size, unsigned char *dest,
-                        unsigned int *frame_flags) {
-  (void)size;
-  (void)dest;
-  (void)frame_flags;
+static void Pass1Encode(VP8_COMP *cpi) {
   vp8_set_quantizer(cpi, 26);
-
   vp8_first_pass(cpi);
 }
 #endif
@@ -2856,7 +2840,6 @@ void write_cx_frame_to_file(YV12_BUFFER_CONFIG *frame, int this_frame)
     fclose(yframe);
 }
 #endif
-/* return of 0 means drop frame */
 
 #if !CONFIG_REALTIME_ONLY
 /* Function to test for conditions that indeicate we should loop
@@ -2919,8 +2902,7 @@ static void update_reference_frames(VP8_COMP *cpi) {
 
     cpi->current_ref_frames[GOLDEN_FRAME] = cm->current_video_frame;
     cpi->current_ref_frames[ALTREF_FRAME] = cm->current_video_frame;
-  } else /* For non key frames */
-  {
+  } else {
     if (cm->refresh_alt_ref_frame) {
       assert(!cm->copy_buffer_to_arf);
 
@@ -2941,8 +2923,7 @@ static void update_reference_frames(VP8_COMP *cpi) {
           cpi->current_ref_frames[ALTREF_FRAME] =
               cpi->current_ref_frames[LAST_FRAME];
         }
-      } else /* if (cm->copy_buffer_to_arf == 2) */
-      {
+      } else {
         if (cm->alt_fb_idx != cm->gld_fb_idx) {
           yv12_fb[cm->gld_fb_idx].flags |= VP8_ALTR_FRAME;
           yv12_fb[cm->alt_fb_idx].flags &= ~VP8_ALTR_FRAME;
@@ -2974,8 +2955,7 @@ static void update_reference_frames(VP8_COMP *cpi) {
           cpi->current_ref_frames[GOLDEN_FRAME] =
               cpi->current_ref_frames[LAST_FRAME];
         }
-      } else /* if (cm->copy_buffer_to_gf == 2) */
-      {
+      } else {
         if (cm->alt_fb_idx != cm->gld_fb_idx) {
           yv12_fb[cm->alt_fb_idx].flags |= VP8_GOLD_FRAME;
           yv12_fb[cm->gld_fb_idx].flags &= ~VP8_GOLD_FRAME;
@@ -3006,8 +2986,7 @@ static void update_reference_frames(VP8_COMP *cpi) {
       int i;
       for (i = LAST_FRAME; i < MAX_REF_FRAMES; ++i)
         vp8_yv12_copy_frame(cpi->Source, &cpi->denoiser.yv12_running_avg[i]);
-    } else /* For non key frames */
-    {
+    } else {
       vp8_yv12_extend_frame_borders(
           &cpi->denoiser.yv12_running_avg[INTRA_FRAME]);
 
@@ -3062,6 +3041,7 @@ static int measure_square_diff_partial(YV12_BUFFER_CONFIG *source,
   }
   // Only return non-zero if we have at least ~1/16 samples for estimate.
   if (num_blocks > (tot_num_blocks >> 4)) {
+    assert(num_blocks != 0);
     return (Total / num_blocks);
   } else {
     return 0;
@@ -3238,7 +3218,7 @@ void vp8_loopfilter_frame(VP8_COMP *cpi, VP8_COMMON *cm) {
   }
 
 #if CONFIG_MULTITHREAD
-  if (cpi->b_multi_threaded) {
+  if (vpx_atomic_load_acquire(&cpi->b_multi_threaded)) {
     sem_post(&cpi->h_event_end_lpf); /* signal that we have set filter_level */
   }
 #endif
@@ -3308,7 +3288,7 @@ static void encode_frame_to_data_rate(VP8_COMP *cpi, size_t *size,
 #endif  // !CONFIG_REALTIME_ONLY
     default:
       cpi->per_frame_bandwidth =
-          (int)(cpi->target_bandwidth / cpi->output_framerate);
+          (int)round(cpi->target_bandwidth / cpi->output_framerate);
       break;
   }
 
@@ -3361,11 +3341,6 @@ static void encode_frame_to_data_rate(VP8_COMP *cpi, size_t *size,
         (LOWER_RES_FRAME_INFO *)cpi->oxcf.mr_low_res_mode_info;
 
     if (cpi->oxcf.mr_encoder_id) {
-      // TODO(marpan): This constraint shouldn't be needed, as we would like
-      // to allow for key frame setting (forced or periodic) defined per
-      // spatial layer. For now, keep this in.
-      cm->frame_type = low_res_frame_info->frame_type;
-
       // Check if lower resolution is available for motion vector reuse.
       if (cm->frame_type != KEY_FRAME) {
         cpi->mr_low_res_mv_avail = 1;
@@ -3390,7 +3365,16 @@ static void encode_frame_to_data_rate(VP8_COMP *cpi, size_t *size,
                      == low_res_frame_info->low_res_ref_frames[ALTREF_FRAME]);
         */
       }
+      // Disable motion vector reuse (i.e., disable any usage of the low_res)
+      // if the previous lower stream is skipped/disabled.
+      if (low_res_frame_info->skip_encoding_prev_stream) {
+        cpi->mr_low_res_mv_avail = 0;
+      }
     }
+    // This stream is not skipped (i.e., it's being encoded), so set this skip
+    // flag to 0. This is needed for the next stream (i.e., which is the next
+    // frame to be encoded).
+    low_res_frame_info->skip_encoding_prev_stream = 0;
 
     // On a key frame: For the lowest resolution, keep track of the key frame
     // counter value. For the higher resolutions, reset the current video
@@ -3524,7 +3508,7 @@ static void encode_frame_to_data_rate(VP8_COMP *cpi, size_t *size,
    * Note that dropping a key frame can be problematic if spatial
    * resampling is also active
    */
-  if (cpi->decimation_factor > 0) {
+  if (cpi->decimation_factor > 0 && cpi->drop_frames_allowed) {
     switch (cpi->decimation_factor) {
       case 1:
         cpi->per_frame_bandwidth = cpi->per_frame_bandwidth * 3 / 2;
@@ -3556,6 +3540,7 @@ static void encode_frame_to_data_rate(VP8_COMP *cpi, size_t *size,
 
       cm->current_video_frame++;
       cpi->frames_since_key++;
+      cpi->ext_refresh_frame_flags_pending = 0;
       // We advance the temporal pattern for dropped frames.
       cpi->temporal_pattern_counter++;
 
@@ -3597,6 +3582,7 @@ static void encode_frame_to_data_rate(VP8_COMP *cpi, size_t *size,
 #endif
     cm->current_video_frame++;
     cpi->frames_since_key++;
+    cpi->ext_refresh_frame_flags_pending = 0;
     // We advance the temporal pattern for dropped frames.
     cpi->temporal_pattern_counter++;
     return;
@@ -3662,7 +3648,7 @@ static void encode_frame_to_data_rate(VP8_COMP *cpi, size_t *size,
         if (cpi->this_key_frame_forced) {
           if (cpi->active_best_quality > cpi->avg_frame_qindex * 7 / 8) {
             cpi->active_best_quality = cpi->avg_frame_qindex * 7 / 8;
-          } else if (cpi->active_best_quality<cpi->avg_frame_qindex>> 2) {
+          } else if (cpi->active_best_quality < (cpi->avg_frame_qindex >> 2)) {
             cpi->active_best_quality = cpi->avg_frame_qindex >> 2;
           }
         }
@@ -3792,9 +3778,11 @@ static void encode_frame_to_data_rate(VP8_COMP *cpi, size_t *size,
   }
 #endif
 
+  compute_skin_map(cpi);
+
   /* Setup background Q adjustment for error resilient mode.
    * For multi-layer encodes only enable this for the base layer.
-  */
+   */
   if (cpi->cyclic_refresh_mode_enabled) {
     // Special case for screen_content_mode with golden frame updates.
     int disable_cr_gf =
@@ -3828,8 +3816,7 @@ static void encode_frame_to_data_rate(VP8_COMP *cpi, size_t *size,
   // (temporal denoising) mode.
   if (cpi->oxcf.noise_sensitivity >= 3) {
     if (cpi->denoiser.denoise_pars.spatial_blur != 0) {
-      vp8_de_noise(cm, cpi->Source, cpi->Source,
-                   cpi->denoiser.denoise_pars.spatial_blur, 1, 0, 0);
+      vp8_de_noise(cm, cpi->Source, cpi->denoiser.denoise_pars.spatial_blur, 1);
     }
   }
 #endif
@@ -3850,9 +3837,9 @@ static void encode_frame_to_data_rate(VP8_COMP *cpi, size_t *size,
     }
 
     if (cm->frame_type == KEY_FRAME) {
-      vp8_de_noise(cm, cpi->Source, cpi->Source, l, 1, 0, 1);
+      vp8_de_noise(cm, cpi->Source, l, 1);
     } else {
-      vp8_de_noise(cm, cpi->Source, cpi->Source, l, 1, 0, 1);
+      vp8_de_noise(cm, cpi->Source, l, 1);
 
       src = cpi->Source->y_buffer;
 
@@ -3865,7 +3852,7 @@ static void encode_frame_to_data_rate(VP8_COMP *cpi, size_t *size,
 #endif
 
 #ifdef OUTPUT_YUV_SRC
-  vp8_write_yuv_frame(yuv_file, cpi->Source);
+  vpx_write_yuv_frame(yuv_file, cpi->Source);
 #endif
 
   do {
@@ -4016,8 +4003,15 @@ static void encode_frame_to_data_rate(VP8_COMP *cpi, size_t *size,
 #else
     /* transform / motion compensation build reconstruction frame */
     vp8_encode_frame(cpi);
-    if (cpi->oxcf.screen_content_mode == 2) {
-      if (vp8_drop_encodedframe_overshoot(cpi, Q)) return;
+
+    if (cpi->pass == 0 && cpi->oxcf.end_usage == USAGE_STREAM_FROM_SERVER) {
+      if (vp8_drop_encodedframe_overshoot(cpi, Q)) {
+        vpx_clear_system_state();
+        return;
+      }
+      if (cm->frame_type != KEY_FRAME)
+        cpi->last_pred_err_mb =
+            (int)(cpi->mb.prediction_error / cpi->common.MBs);
     }
 
     cpi->projected_frame_size -= vp8_estimate_entropy_savings(cpi);
@@ -4073,7 +4067,8 @@ static void encode_frame_to_data_rate(VP8_COMP *cpi, size_t *size,
     if (frame_over_shoot_limit == 0) frame_over_shoot_limit = 1;
 
     /* Are we are overshooting and up against the limit of active max Q. */
-    if (((cpi->pass != 2) ||
+    if (!cpi->rt_always_update_correction_factor &&
+        ((cpi->pass != 2) ||
          (cpi->oxcf.end_usage == USAGE_STREAM_FROM_SERVER)) &&
         (Q == cpi->active_worst_quality) &&
         (cpi->active_worst_quality < cpi->worst_quality) &&
@@ -4092,9 +4087,9 @@ static void encode_frame_to_data_rate(VP8_COMP *cpi, size_t *size,
 #if !CONFIG_REALTIME_ONLY
       top_index = cpi->active_worst_quality;
 #endif  // !CONFIG_REALTIME_ONLY
-        /* If we have updated the active max Q do not call
-         * vp8_update_rate_correction_factors() this loop.
-         */
+      /* If we have updated the active max Q do not call
+       * vp8_update_rate_correction_factors() this loop.
+       */
       active_worst_qchanged = 1;
     } else {
       active_worst_qchanged = 0;
@@ -4270,11 +4265,10 @@ static void encode_frame_to_data_rate(VP8_COMP *cpi, size_t *size,
       }
 
       /* Clamp cpi->zbin_over_quant */
-      cpi->mb.zbin_over_quant = (cpi->mb.zbin_over_quant < zbin_oq_low)
-                                    ? zbin_oq_low
-                                    : (cpi->mb.zbin_over_quant > zbin_oq_high)
-                                          ? zbin_oq_high
-                                          : cpi->mb.zbin_over_quant;
+      cpi->mb.zbin_over_quant =
+          (cpi->mb.zbin_over_quant < zbin_oq_low)    ? zbin_oq_low
+          : (cpi->mb.zbin_over_quant > zbin_oq_high) ? zbin_oq_high
+                                                     : cpi->mb.zbin_over_quant;
 
       Loop = Q != last_q;
     } else {
@@ -4300,6 +4294,7 @@ static void encode_frame_to_data_rate(VP8_COMP *cpi, size_t *size,
     cpi->common.current_video_frame++;
     cpi->frames_since_key++;
     cpi->drop_frame_count++;
+    cpi->ext_refresh_frame_flags_pending = 0;
     // We advance the temporal pattern for dropped frames.
     cpi->temporal_pattern_counter++;
     return;
@@ -4408,8 +4403,10 @@ static void encode_frame_to_data_rate(VP8_COMP *cpi, size_t *size,
   /* For inter frames the current default behavior is that when
    * cm->refresh_golden_frame is set we copy the old GF over to the ARF buffer
    * This is purely an encoder decision at present.
+   * Avoid this behavior when refresh flags are set by the user.
    */
-  if (!cpi->oxcf.error_resilient_mode && cm->refresh_golden_frame) {
+  if (!cpi->oxcf.error_resilient_mode && cm->refresh_golden_frame &&
+      !cpi->ext_refresh_frame_flags_pending) {
     cm->copy_buffer_to_arf = 2;
   } else {
     cm->copy_buffer_to_arf = 0;
@@ -4448,11 +4445,20 @@ static void encode_frame_to_data_rate(VP8_COMP *cpi, size_t *size,
   }
 #endif
 
+#ifdef OUTPUT_YUV_SKINMAP
+  if (cpi->common.current_video_frame > 1) {
+    vp8_compute_skin_map(cpi, yuv_skinmap_file);
+  }
+#endif
+
 #if CONFIG_MULTITHREAD
-  if (cpi->b_multi_threaded) {
+  if (vpx_atomic_load_acquire(&cpi->b_multi_threaded)) {
     /* start loopfilter in separate thread */
     sem_post(&cpi->h_event_start_lpf);
     cpi->b_lpf_running = 1;
+    /* wait for the filter_level to be picked so that we can continue with
+     * stream packing */
+    sem_wait(&cpi->h_event_end_lpf);
   } else
 #endif
   {
@@ -4482,7 +4488,7 @@ static void encode_frame_to_data_rate(VP8_COMP *cpi, size_t *size,
   update_reference_frames(cpi);
 
 #ifdef OUTPUT_YUV_DENOISED
-  vp8_write_yuv_frame(yuv_denoised_file,
+  vpx_write_yuv_frame(yuv_denoised_file,
                       &cpi->denoiser.yv12_running_avg[INTRA_FRAME]);
 #endif
 
@@ -4490,12 +4496,6 @@ static void encode_frame_to_data_rate(VP8_COMP *cpi, size_t *size,
   if (cpi->oxcf.error_resilient_mode) {
     cm->refresh_entropy_probs = 0;
   }
-#endif
-
-#if CONFIG_MULTITHREAD
-  /* wait that filter_level is picked so that we can continue with stream
-   * packing */
-  if (cpi->b_multi_threaded) sem_wait(&cpi->h_event_end_lpf);
 #endif
 
   /* build the bitstream */
@@ -4585,10 +4585,10 @@ static void encode_frame_to_data_rate(VP8_COMP *cpi, size_t *size,
     cpi->bits_off_target = cpi->oxcf.maximum_buffer_size;
   }
 
-  // If the frame dropper is not enabled, don't let the buffer level go below
-  // some threshold, given here by -|maximum_buffer_size|. For now we only do
-  // this for screen content input.
-  if (cpi->drop_frames_allowed == 0 && cpi->oxcf.screen_content_mode &&
+  // Don't let the buffer level go below some threshold, given here
+  // by -|maximum_buffer_size|. For now we only do this for
+  // screen content input.
+  if (cpi->oxcf.screen_content_mode &&
       cpi->bits_off_target < -cpi->oxcf.maximum_buffer_size) {
     cpi->bits_off_target = -cpi->oxcf.maximum_buffer_size;
   }
@@ -4596,22 +4596,24 @@ static void encode_frame_to_data_rate(VP8_COMP *cpi, size_t *size,
   /* Rolling monitors of whether we are over or underspending used to
    * help regulate min and Max Q in two pass.
    */
-  cpi->rolling_target_bits =
-      ((cpi->rolling_target_bits * 3) + cpi->this_frame_target + 2) / 4;
-  cpi->rolling_actual_bits =
-      ((cpi->rolling_actual_bits * 3) + cpi->projected_frame_size + 2) / 4;
-  cpi->long_rolling_target_bits =
-      ((cpi->long_rolling_target_bits * 31) + cpi->this_frame_target + 16) / 32;
-  cpi->long_rolling_actual_bits =
-      ((cpi->long_rolling_actual_bits * 31) + cpi->projected_frame_size + 16) /
-      32;
+  cpi->rolling_target_bits = (int)ROUND64_POWER_OF_TWO(
+      (int64_t)cpi->rolling_target_bits * 3 + cpi->this_frame_target, 2);
+  cpi->rolling_actual_bits = (int)ROUND64_POWER_OF_TWO(
+      (int64_t)cpi->rolling_actual_bits * 3 + cpi->projected_frame_size, 2);
+  cpi->long_rolling_target_bits = (int)ROUND64_POWER_OF_TWO(
+      (int64_t)cpi->long_rolling_target_bits * 31 + cpi->this_frame_target, 5);
+  cpi->long_rolling_actual_bits = (int)ROUND64_POWER_OF_TWO(
+      (int64_t)cpi->long_rolling_actual_bits * 31 + cpi->projected_frame_size,
+      5);
 
   /* Actual bits spent */
   cpi->total_actual_bits += cpi->projected_frame_size;
 
+#if 0 && CONFIG_INTERNAL_STATS
   /* Debug stats */
   cpi->total_target_vs_actual +=
       (cpi->this_frame_target - cpi->projected_frame_size);
+#endif
 
   cpi->buffer_level = cpi->bits_off_target;
 
@@ -4621,8 +4623,8 @@ static void encode_frame_to_data_rate(VP8_COMP *cpi, size_t *size,
 
     for (i = cpi->current_layer + 1; i < cpi->oxcf.number_of_layers; ++i) {
       LAYER_CONTEXT *lc = &cpi->layer_context[i];
-      int bits_off_for_this_layer = (int)(lc->target_bandwidth / lc->framerate -
-                                          cpi->projected_frame_size);
+      int bits_off_for_this_layer = (int)round(
+          lc->target_bandwidth / lc->framerate - cpi->projected_frame_size);
 
       lc->bits_off_target += bits_off_for_this_layer;
 
@@ -4733,6 +4735,8 @@ static void encode_frame_to_data_rate(VP8_COMP *cpi, size_t *size,
 
 #endif
 
+  cpi->ext_refresh_frame_flags_pending = 0;
+
   if (cm->refresh_golden_frame == 1) {
     cm->frame_flags = cm->frame_flags | FRAMEFLAGS_GOLDEN;
   } else {
@@ -4816,8 +4820,6 @@ static void encode_frame_to_data_rate(VP8_COMP *cpi, size_t *size,
     cpi->temporal_pattern_counter++;
   }
 
-/* reset to normal state now that we are done. */
-
 #if 0
     {
         char filename[512];
@@ -4831,7 +4833,7 @@ static void encode_frame_to_data_rate(VP8_COMP *cpi, size_t *size,
 #endif
 
   /* DEBUG */
-  /* vp8_write_yuv_frame("encoder_recon.yuv", cm->frame_to_show); */
+  /* vpx_write_yuv_frame("encoder_recon.yuv", cm->frame_to_show); */
 }
 #if !CONFIG_REALTIME_ONLY
 static void Pass2Encode(VP8_COMP *cpi, size_t *size, unsigned char *dest,
@@ -4915,14 +4917,6 @@ int vp8_get_compressed_data(VP8_COMP *cpi, unsigned int *frame_flags,
   if (!cpi) return -1;
 
   cm = &cpi->common;
-
-  if (setjmp(cpi->common.error.jmp)) {
-    cpi->common.error.setjmp = 0;
-    vpx_clear_system_state();
-    return VPX_CODEC_CORRUPT_FRAME;
-  }
-
-  cpi->common.error.setjmp = 1;
 
   vpx_usec_timer_start(&cmptimer);
 
@@ -5012,6 +5006,8 @@ int vp8_get_compressed_data(VP8_COMP *cpi, unsigned int *frame_flags,
 
       this_duration = cpi->source->ts_end - cpi->last_end_time_stamp_seen;
       last_duration = cpi->last_end_time_stamp_seen - cpi->last_time_stamp_seen;
+      // Cap this to avoid overflow of (this_duration - last_duration) * 10
+      this_duration = VPXMIN(this_duration, INT64_MAX / 10);
       /* do a step update if the duration changes by 10% */
       if (last_duration) {
         step = (int)(((this_duration - last_duration) * 10 / last_duration));
@@ -5049,10 +5045,13 @@ int vp8_get_compressed_data(VP8_COMP *cpi, unsigned int *frame_flags,
         // be received for that high layer, which will yield an incorrect
         // frame rate (from time-stamp adjustment in above calculation).
         if (cpi->oxcf.mr_encoder_id) {
-          cpi->ref_framerate = low_res_frame_info->low_res_framerate;
+          if (!low_res_frame_info->skip_encoding_base_stream)
+            cpi->ref_framerate = low_res_frame_info->low_res_framerate;
         } else {
           // Keep track of frame rate for lowest resolution.
           low_res_frame_info->low_res_framerate = cpi->ref_framerate;
+          // The base stream is being encoded so set skip flag to 0.
+          low_res_frame_info->skip_encoding_base_stream = 0;
         }
       }
 #endif
@@ -5078,7 +5077,7 @@ int vp8_get_compressed_data(VP8_COMP *cpi, unsigned int *frame_flags,
   if (cpi->oxcf.number_of_layers > 1) {
     int layer;
 
-    update_layer_contexts(cpi);
+    vp8_update_layer_contexts(cpi);
 
     /* Restore layer specific context & set frame rate */
     if (cpi->temporal_layer_id >= 0) {
@@ -5088,7 +5087,7 @@ int vp8_get_compressed_data(VP8_COMP *cpi, unsigned int *frame_flags,
           cpi->oxcf
               .layer_id[cpi->temporal_pattern_counter % cpi->oxcf.periodicity];
     }
-    restore_layer_context(cpi, layer);
+    vp8_restore_layer_context(cpi, layer);
     vp8_new_framerate(cpi, cpi->layer_context[layer].framerate);
   }
 
@@ -5158,7 +5157,7 @@ int vp8_get_compressed_data(VP8_COMP *cpi, unsigned int *frame_flags,
   }
   switch (cpi->pass) {
 #if !CONFIG_REALTIME_ONLY
-    case 1: Pass1Encode(cpi, size, dest, frame_flags); break;
+    case 1: Pass1Encode(cpi); break;
     case 2: Pass2Encode(cpi, size, dest, dest_end, frame_flags); break;
 #endif  // !CONFIG_REALTIME_ONLY
     default:
@@ -5219,7 +5218,7 @@ int vp8_get_compressed_data(VP8_COMP *cpi, unsigned int *frame_flags,
   }
 
   /* Save layer specific state */
-  if (cpi->oxcf.number_of_layers > 1) save_layer_context(cpi);
+  if (cpi->oxcf.number_of_layers > 1) vp8_save_layer_context(cpi);
 
   vpx_usec_timer_mark(&cmptimer);
   cpi->time_compress_data += vpx_usec_timer_elapsed(&cmptimer);
@@ -5277,7 +5276,7 @@ int vp8_get_compressed_data(VP8_COMP *cpi, unsigned int *frame_flags,
           double weight = 0;
 
           vp8_deblock(cm, cm->frame_to_show, &cm->post_proc_buffer,
-                      cm->filter_level * 10 / 6, 1, 0);
+                      cm->filter_level * 10 / 6);
           vpx_clear_system_state();
 
           ye = calc_plane_error(orig->y_buffer, orig->y_stride, pp->y_buffer,
@@ -5355,7 +5354,7 @@ int vp8_get_compressed_data(VP8_COMP *cpi, unsigned int *frame_flags,
 
 #if CONFIG_MULTITHREAD
   /* wait for the lpf thread done */
-  if (cpi->b_multi_threaded && cpi->b_lpf_running) {
+  if (vpx_atomic_load_acquire(&cpi->b_multi_threaded) && cpi->b_lpf_running) {
     sem_wait(&cpi->h_event_end_lpf);
     cpi->b_lpf_running = 0;
   }
@@ -5401,28 +5400,25 @@ int vp8_set_roimap(VP8_COMP *cpi, unsigned char *map, unsigned int rows,
   const int range = 63;
   int i;
 
-  // This method is currently incompatible with the cyclic refresh method
-  if (cpi->cyclic_refresh_mode_enabled) return -1;
-
   // Check number of rows and columns match
   if (cpi->common.mb_rows != (int)rows || cpi->common.mb_cols != (int)cols) {
     return -1;
   }
 
-  // Range check the delta Q values and convert the external Q range values
-  // to internal ones.
-  if ((abs(delta_q[0]) > range) || (abs(delta_q[1]) > range) ||
-      (abs(delta_q[2]) > range) || (abs(delta_q[3]) > range)) {
-    return -1;
+  for (i = 0; i < MAX_MB_SEGMENTS; ++i) {
+    // Note abs() alone can't be used as the behavior of abs(INT_MIN) is
+    // undefined.
+    if (delta_q[i] > range || delta_q[i] < -range || delta_lf[i] > range ||
+        delta_lf[i] < -range) {
+      return -1;
+    }
   }
 
-  // Range check the delta lf values
-  if ((abs(delta_lf[0]) > range) || (abs(delta_lf[1]) > range) ||
-      (abs(delta_lf[2]) > range) || (abs(delta_lf[3]) > range)) {
-    return -1;
-  }
-
-  if (!map) {
+  // Also disable segmentation if no deltas are specified.
+  if (!map || (delta_q[0] == 0 && delta_q[1] == 0 && delta_q[2] == 0 &&
+               delta_q[3] == 0 && delta_lf[0] == 0 && delta_lf[1] == 0 &&
+               delta_lf[2] == 0 && delta_lf[3] == 0 && threshold[0] == 0 &&
+               threshold[1] == 0 && threshold[2] == 0 && threshold[3] == 0)) {
     disable_segmentation(cpi);
     return 0;
   }
@@ -5458,6 +5454,11 @@ int vp8_set_roimap(VP8_COMP *cpi, unsigned char *map, unsigned int rows,
 
   /* Initialise the feature data structure */
   set_segment_data(cpi, &feature_data[0][0], SEGMENT_DELTADATA);
+
+  if (threshold[0] != 0 || threshold[1] != 0 || threshold[2] != 0 ||
+      threshold[3] != 0)
+    cpi->use_roi_static_threshold = 1;
+  cpi->cyclic_refresh_mode_enabled = 0;
 
   return 0;
 }

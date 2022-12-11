@@ -107,24 +107,29 @@ TEST_P(MinMaxTest, CompareReferenceAndVaryStride) {
       int min_ref, max_ref, min, max;
       reference_minmax(a, a_stride, b, b_stride, &min_ref, &max_ref);
       ASM_REGISTER_STATE_CHECK(mm_func_(a, a_stride, b, b_stride, &min, &max));
-      EXPECT_EQ(max_ref, max) << "when a_stride = " << a_stride
-                              << " and b_stride = " << b_stride;
-      EXPECT_EQ(min_ref, min) << "when a_stride = " << a_stride
-                              << " and b_stride = " << b_stride;
+      EXPECT_EQ(max_ref, max)
+          << "when a_stride = " << a_stride << " and b_stride = " << b_stride;
+      EXPECT_EQ(min_ref, min)
+          << "when a_stride = " << a_stride << " and b_stride = " << b_stride;
     }
   }
 }
 
-INSTANTIATE_TEST_CASE_P(C, MinMaxTest, ::testing::Values(&vpx_minmax_8x8_c));
+INSTANTIATE_TEST_SUITE_P(C, MinMaxTest, ::testing::Values(&vpx_minmax_8x8_c));
 
 #if HAVE_SSE2
-INSTANTIATE_TEST_CASE_P(SSE2, MinMaxTest,
-                        ::testing::Values(&vpx_minmax_8x8_sse2));
+INSTANTIATE_TEST_SUITE_P(SSE2, MinMaxTest,
+                         ::testing::Values(&vpx_minmax_8x8_sse2));
 #endif
 
 #if HAVE_NEON
-INSTANTIATE_TEST_CASE_P(NEON, MinMaxTest,
-                        ::testing::Values(&vpx_minmax_8x8_neon));
+INSTANTIATE_TEST_SUITE_P(NEON, MinMaxTest,
+                         ::testing::Values(&vpx_minmax_8x8_neon));
+#endif
+
+#if HAVE_MSA
+INSTANTIATE_TEST_SUITE_P(MSA, MinMaxTest,
+                         ::testing::Values(&vpx_minmax_8x8_msa));
 #endif
 
 }  // namespace
