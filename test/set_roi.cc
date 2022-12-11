@@ -146,14 +146,6 @@ TEST(VP8RoiMapTest, ParameterCheck) {
       if (deltas_valid != roi_retval) break;
     }
 
-    // Test that we report and error if cyclic refresh is enabled.
-    cpi.cyclic_refresh_mode_enabled = 1;
-    roi_retval =
-        vp8_set_roimap(&cpi, roi_map, cpi.common.mb_rows, cpi.common.mb_cols,
-                       delta_q, delta_lf, threshold);
-    EXPECT_EQ(-1, roi_retval) << "cyclic refresh check error";
-    cpi.cyclic_refresh_mode_enabled = 0;
-
     // Test invalid number of rows or colums.
     roi_retval =
         vp8_set_roimap(&cpi, roi_map, cpi.common.mb_rows + 1,
@@ -169,6 +161,6 @@ TEST(VP8RoiMapTest, ParameterCheck) {
   // Free allocated memory
   if (cpi.segmentation_map) vpx_free(cpi.segmentation_map);
   if (roi_map) vpx_free(roi_map);
-};
+}
 
 }  // namespace

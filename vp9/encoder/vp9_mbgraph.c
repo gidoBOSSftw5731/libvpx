@@ -45,29 +45,30 @@ static unsigned int do_16x16_motion_iteration(VP9_COMP *cpi, const MV *ref_mv,
 
   mv_sf->search_method = HEX;
   vp9_full_pixel_search(cpi, x, BLOCK_16X16, &ref_full, step_param,
-                        x->errorperbit, cond_cost_list(cpi, cost_list), ref_mv,
-                        dst_mv, 0, 0);
+                        cpi->sf.mv.search_method, x->errorperbit,
+                        cond_cost_list(cpi, cost_list), ref_mv, dst_mv, 0, 0);
   mv_sf->search_method = old_search_method;
+
+  /* restore UMV window */
+  x->mv_limits = tmp_mv_limits;
 
   // Try sub-pixel MC
   // if (bestsme > error_thresh && bestsme < INT_MAX)
   {
     uint32_t distortion;
     uint32_t sse;
+    // TODO(yunqing): may use higher tap interp filter than 2 taps if needed.
     cpi->find_fractional_mv_step(
         x, dst_mv, ref_mv, cpi->common.allow_high_precision_mv, x->errorperbit,
-        &v_fn_ptr, 0, mv_sf->subpel_iters_per_step,
+        &v_fn_ptr, 0, mv_sf->subpel_search_level,
         cond_cost_list(cpi, cost_list), NULL, NULL, &distortion, &sse, NULL, 0,
-        0);
+        0, USE_2_TAPS);
   }
 
   xd->mi[0]->mode = NEWMV;
   xd->mi[0]->mv[0].as_mv = *dst_mv;
 
   vp9_build_inter_predictors_sby(xd, mb_row, mb_col, BLOCK_16X16);
-
-  /* restore UMV window */
-  x->mv_limits = tmp_mv_limits;
 
   return vpx_sad16x16(x->plane[0].src.buf, x->plane[0].src.stride,
                       xd->plane[0].dst.buf, xd->plane[0].dst.stride);
@@ -218,7 +219,7 @@ static void update_mbgraph_frame_stats(VP9_COMP *cpi,
   VP9_COMMON *const cm = &cpi->common;
 
   int mb_col, mb_row, offset = 0;
-  int mb_y_offset = 0, arf_y_offset = 0, gld_y_offset = 0;
+  int mb_y_offset = 0;
   MV gld_top_mv = { 0, 0 };
   MODE_INFO mi_local;
   MODE_INFO mi_above, mi_left;
@@ -242,8 +243,6 @@ static void update_mbgraph_frame_stats(VP9_COMP *cpi,
   for (mb_row = 0; mb_row < cm->mb_rows; mb_row++) {
     MV gld_left_mv = gld_top_mv;
     int mb_y_in_offset = mb_y_offset;
-    int arf_y_in_offset = arf_y_offset;
-    int gld_y_in_offset = gld_y_offset;
 
     // Set up limit values for motion vectors to prevent them extending outside
     // the UMV borders.
@@ -265,8 +264,6 @@ static void update_mbgraph_frame_stats(VP9_COMP *cpi,
       xd->left_mi = &mi_left;
 
       mb_y_in_offset += 16;
-      gld_y_in_offset += 16;
-      arf_y_in_offset += 16;
       x->mv_limits.col_min -= 16;
       x->mv_limits.col_max -= 16;
     }
@@ -275,8 +272,6 @@ static void update_mbgraph_frame_stats(VP9_COMP *cpi,
     xd->above_mi = &mi_above;
 
     mb_y_offset += buf->y_stride * 16;
-    gld_y_offset += golden_ref->y_stride * 16;
-    if (alt_ref) arf_y_offset += alt_ref->y_stride * 16;
     x->mv_limits.row_min -= 16;
     x->mv_limits.row_max -= 16;
     offset += cm->mb_cols;
